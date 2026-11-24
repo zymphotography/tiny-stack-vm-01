@@ -1,222 +1,62 @@
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-
-// Tiny stack VM for make.fun's tiny-stack-vm-01 (ISA v1).
-// One run answers a whole set: it reads every /input/<id>/program.bin with
-// its /input/<id>/input.bin and writes /output/<id>/stdout.bin plus
-// /output/<id>/exit.txt for each of them.
-
-const STEP_MAX = 1000000;
-const OUT_MAX = 65536;
-const STACK_MAX = 256;
-const CALL_MAX = 64;
-const MEM_WORDS = 256;
-
-// Opcode byte -> [immediate bytes, values popped, values pushed].
-const META = {
-  0x00: [0, 0, 0], // HALT
-  0x01: [1, 0, 1], // PUSH8
-  0x02: [4, 0, 1], // PUSH32
-  0x03: [0, 1, 0], // POP
-  0x04: [0, 1, 2], // DUP
-  0x05: [0, 2, 2], // SWAP
-  0x06: [0, 2, 3], // OVER
-  0x07: [0, 3, 3], // ROT
-  0x10: [0, 2, 1], // ADD
-  0x11: [0, 2, 1], // SUB
-  0x12: [0, 2, 1], // MUL
-  0x13: [0, 2, 1], // DIV
-  0x14: [0, 2, 1], // MOD
-  0x15: [0, 2, 1], // DIVU
-  0x16: [0, 2, 1], // MODU
-  0x17: [0, 1, 1], // NEG
-  0x18: [0, 2, 1], // AND
-  0x19: [0, 2, 1], // OR
-  0x1a: [0, 2, 1], // XOR
-  0x1b: [0, 1, 1], // NOT
-  0x1c: [0, 2, 1], // SHL
-  0x1d: [0, 2, 1], // SHR
-  0x1e: [0, 2, 1], // SHRU
-  0x20: [0, 2, 1], // EQ
-  0x21: [0, 2, 1], // LT
-  0x22: [0, 2, 1], // LTU
-  0x30: [2, 0, 0], // JMP
-  0x31: [2, 1, 0], // JZ
-  0x32: [2, 1, 0], // JNZ
-  0x33: [2, 0, 0], // CALL
-  0x34: [0, 0, 0], // RET
-  0x40: [0, 1, 1], // LOAD
-  0x41: [0, 2, 0], // STORE
-  0x50: [0, 1, 0], // PRINT
-  0x51: [0, 1, 0], // PUTC
-  0x52: [0, 0, 1], // IN
-  0x53: [0, 1, 0], // EXIT
-};
-
-// Runs one program on its input bytes. Returns the bytes it wrote and the
-// exit code it ended with (a trap's code included).
-function run(prog, input) {
-  const n = prog.length;
-  const st = new Int32Array(STACK_MAX);
-  let sp = 0;
-  const cs = new Int32Array(CALL_MAX);
-  let cp = 0;
-  const mem = new Int32Array(MEM_WORDS);
-  const out = new Uint8Array(OUT_MAX);
-  let olen = 0;
-  let ipos = 0;
-  let pc = 0;
-  let steps = 0;
-  const end = (exit) => ({ out: out.subarray(0, olen), exit });
-
-  for (;;) {
-    if (steps === STEP_MAX) return end(10);
-    if (pc < 0 || pc >= n) return end(9);
-    const op = prog[pc];
-    const m = META[op];
-    if (m === undefined) return end(5);
-    const imm = m[0];
-    if (pc + imm >= n) return end(9);
-    steps++;
-    const next = pc + 1 + imm;
-    if (sp < m[1]) return end(2);
-    if (sp - m[1] + m[2] > STACK_MAX) return end(3);
-    pc = next;
-
-    switch (op) {
-      case 0x00: // HALT
-        return end(0);
-      case 0x01: // PUSH8, sign-extended
-        st[sp++] = (prog[next - 1] << 24) >> 24;
-        break;
-      case 0x02: // PUSH32, little-endian
-        st[sp++] = prog[next - 4] | (prog[next - 3] << 8) | (prog[next - 2] << 16) | (prog[next - 1] << 24);
-        break;
-      case 0x03: // POP
-        sp--;
-        break;
-      case 0x04: // DUP
-        st[sp] = st[sp - 1];
-        sp++;
-        break;
-      case 0x05: { // SWAP
-        const t = st[sp - 1];
-        st[sp - 1] = st[sp - 2];
-        st[sp - 2] = t;
-        break;
-      }
-      case 0x06: // OVER
-        st[sp] = st[sp - 2];
-        sp++;
-        break;
-      case 0x07: { // ROT
-        const a = st[sp - 3];
-        st[sp - 3] = st[sp - 2];
-        st[sp - 2] = st[sp - 1];
-        st[sp - 1] = a;
-        break;
-      }
-      case 0x17: // NEG
-        st[sp - 1] = (-st[sp - 1]) | 0;
-        break;
-      case 0x1b: // NOT
-        st[sp - 1] = ~st[sp - 1];
-        break;
-      case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16:
-      case 0x18: case 0x19: case 0x1a: case 0x1c: case 0x1d: case 0x1e:
-      case 0x20: case 0x21: case 0x22: {
-        const b = st[sp - 1];
-        const a = st[sp - 2];
-        let r;
-        if (op === 0x10) r = (a + b) | 0;
-        else if (op === 0x11) r = (a - b) | 0;
-        else if (op === 0x12) r = Math.imul(a, b);
-        else if (op === 0x13) {
-          if (b === 0) return end(4);
-          r = a === -2147483648 && b === -1 ? a : (a / b) | 0;
-        } else if (op === 0x14) {
-          if (b === 0) return end(4);
-          r = b === -1 ? 0 : (a % b) | 0;
-        } else if (op === 0x15) {
-          if (b === 0) return end(4);
-          r = Math.floor((a >>> 0) / (b >>> 0)) | 0;
-        } else if (op === 0x16) {
-          if (b === 0) return end(4);
-          r = ((a >>> 0) % (b >>> 0)) | 0;
-        } else if (op === 0x18) r = a & b;
-        else if (op === 0x19) r = a | b;
-        else if (op === 0x1a) r = a ^ b;
-        else if (op === 0x1c) r = a << (b & 31);
-        else if (op === 0x1d) r = a >> (b & 31);
-        else if (op === 0x1e) r = (a >>> (b & 31)) | 0;
-        else if (op === 0x20) r = a === b ? 1 : 0;
-        else if (op === 0x21) r = a < b ? 1 : 0;
-        else r = (a >>> 0) < (b >>> 0) ? 1 : 0;
-        sp -= 2;
-        st[sp++] = r;
-        break;
-      }
-      case 0x30: case 0x31: case 0x32: { // JMP, JZ, JNZ
-        const rel = ((prog[next - 2] | (prog[next - 1] << 8)) << 16) >> 16;
-        if (op === 0x30) {
-          pc = next + rel;
-          break;
-        }
-        const v = st[--sp];
-        if ((op === 0x31) === (v === 0)) pc = next + rel;
-        break;
-      }
-      case 0x33: // CALL, absolute address
-        if (cp === CALL_MAX) return end(7);
-        cs[cp++] = next;
-        pc = prog[next - 2] | (prog[next - 1] << 8);
-        break;
-      case 0x34: // RET
-        if (cp === 0) return end(8);
-        pc = cs[--cp];
-        break;
-      case 0x40: { // LOAD
-        const addr = st[sp - 1];
-        if (addr < 0 || addr >= MEM_WORDS) return end(6);
-        st[sp - 1] = mem[addr];
-        break;
-      }
-      case 0x41: { // STORE
-        const addr = st[sp - 1];
-        if (addr < 0 || addr >= MEM_WORDS) return end(6);
-        mem[addr] = st[sp - 2];
-        sp -= 2;
-        break;
-      }
-      case 0x50: { // PRINT, decimal ASCII, no newline
-        const s = String(st[sp - 1]);
-        if (olen + s.length > OUT_MAX) return end(11);
-        sp--;
-        for (let i = 0; i < s.length; i++) out[olen++] = s.charCodeAt(i);
-        break;
-      }
-      case 0x51: // PUTC, one low byte
-        if (olen + 1 > OUT_MAX) return end(11);
-        out[olen++] = st[--sp] & 255;
-        break;
-      case 0x52: // IN, -1 once the input is used up
-        st[sp++] = ipos < input.length ? input[ipos++] : -1;
-        break;
-      case 0x53: // EXIT, low byte of the top value
-        return end(st[--sp] & 255);
-    }
-  }
+import{mkdirSync as M,readFileSync as R,readdirSync as D,writeFileSync as W}from'node:fs';
+const T={0:[0,0,0],1:[1,0,1],2:[4,0,1],3:[0,1,0],4:[0,1,2],5:[0,2,2],6:[0,2,3],7:[0,3,3],16:[0,2,1],17:[0,2,1],18:[0,2,1],19:[0,2,1],20:[0,2,1],21:[0,2,1],22:[0,2,1],23:[0,1,1],24:[0,2,1],25:[0,2,1],26:[0,2,1],27:[0,1,1],28:[0,2,1],29:[0,2,1],30:[0,2,1],32:[0,2,1],33:[0,2,1],34:[0,2,1],48:[2,0,0],49:[2,1,0],50:[2,1,0],51:[2,0,0],52:[0,0,0],64:[0,1,1],65:[0,2,0],80:[0,1,0],81:[0,1,0],82:[0,0,1],83:[0,1,0]};
+function V(p,g){
+const n=p.length,s=new Int32Array(256);let t=0;
+const c=new Int32Array(64);let u=0;
+const m=new Int32Array(256),o=new Uint8Array(65536);let l=0,q=0,x=0,k=0;
+const E=e=>[o.subarray(0,l),e];
+for(;;){
+if(k==1e6)return E(10);
+if(x<0||x>=n)return E(9);
+const y=p[x],z=T[y];
+if(z===undefined)return E(5);
+const f=z[0];
+if(x+f>=n)return E(9);
+k++;
+const j=x+1+f;
+if(t<z[1])return E(2);
+if(t-z[1]+z[2]>256)return E(3);
+x=j;
+switch(y){
+case 0:return E(0);
+case 1:s[t++]=(p[j-1]<<24)>>24;break;
+case 2:s[t++]=p[j-4]|p[j-3]<<8|p[j-2]<<16|p[j-1]<<24;break;
+case 3:t--;break;
+case 4:s[t]=s[t-1];t++;break;
+case 5:{const a=s[t-1];s[t-1]=s[t-2];s[t-2]=a;break;}
+case 6:s[t]=s[t-2];t++;break;
+case 7:{const a=s[t-3];s[t-3]=s[t-2];s[t-2]=s[t-1];s[t-1]=a;break;}
+case 23:s[t-1]=-s[t-1]|0;break;
+case 27:s[t-1]=~s[t-1];break;
+case 16:case 17:case 18:case 19:case 20:case 21:case 22:case 24:case 25:case 26:case 28:case 29:case 30:case 32:case 33:case 34:{
+const b=s[t-1],a=s[t-2];let v;
+if(y==16)v=a+b|0;else if(y==17)v=a-b|0;else if(y==18)v=Math.imul(a,b);
+else if(y==19){if(!b)return E(4);v=a==-2147483648&&b==-1?a:a/b|0;}
+else if(y==20){if(!b)return E(4);v=b==-1?0:a%b|0;}
+else if(y==21){if(!b)return E(4);v=Math.floor((a>>>0)/(b>>>0))|0;}
+else if(y==22){if(!b)return E(4);v=(a>>>0)%(b>>>0)|0;}
+else if(y==24)v=a&b;else if(y==25)v=a|b;else if(y==26)v=a^b;
+else if(y==28)v=a<<(b&31);else if(y==29)v=a>>(b&31);else if(y==30)v=(a>>>(b&31))|0;
+else if(y==32)v=a==b?1:0;else if(y==33)v=a<b?1:0;else v=(a>>>0)<(b>>>0)?1:0;
+t-=2;s[t++]=v;break;}
+case 48:case 49:case 50:{
+const r=(p[j-2]|p[j-1]<<8)<<16>>16;
+if(y==48){x=j+r;break;}
+const v=s[--t];
+if((y==49)==(v==0))x=j+r;
+break;}
+case 51:if(u==64)return E(7);c[u++]=j;x=p[j-2]|p[j-1]<<8;break;
+case 52:if(!u)return E(8);x=c[--u];break;
+case 64:{const a=s[t-1];if(a<0||a>255)return E(6);s[t-1]=m[a];break;}
+case 65:{const a=s[t-1];if(a<0||a>255)return E(6);m[a]=s[t-2];t-=2;break;}
+case 80:{const a=String(s[t-1]);if(l+a.length>65536)return E(11);t--;for(let i=0;i<a.length;i++)o[l++]=a.charCodeAt(i);break;}
+case 81:if(l+1>65536)return E(11);o[l++]=s[--t]&255;break;
+case 82:s[t++]=q<g.length?g[q++]:-1;break;
+case 83:return E(s[--t]&255);
+}}
 }
-
-// Answer the whole set: one /output/<id>/ per /input/<id>/. Under the local
-// grader the two directories arrive as environment variables instead.
-const IN_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const ids = readdirSync(IN_DIR).sort();
-for (const id of ids) {
-  const dir = IN_DIR + '/' + id;
-  const r = run(readFileSync(dir + '/program.bin'), readFileSync(dir + '/input.bin'));
-  const od = OUT_DIR + '/' + id;
-  mkdirSync(od, { recursive: true });
-  writeFileSync(od + '/stdout.bin', r.out);
-  writeFileSync(od + '/exit.txt', String(r.exit));
+const I=process.env.MAKEFUN_INPUT_DIR||'/input',O=process.env.MAKEFUN_OUTPUT_DIR||'/output';
+for(const d of D(I).sort()){
+const A=I+'/'+d,[b,e]=V(R(A+'/program.bin'),R(A+'/input.bin')),Q=O+'/'+d;
+M(Q,{recursive:true});W(Q+'/stdout.bin',b);W(Q+'/exit.txt',''+e);
 }
