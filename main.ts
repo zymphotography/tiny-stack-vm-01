@@ -31,9 +31,9 @@ case 27:s[t-1]=~s[t-1];break;
 case 16:case 17:case 18:case 19:case 20:case 21:case 22:case 24:case 25:case 26:case 28:case 29:case 30:case 32:case 33:case 34:{
 const b=s[t-1],a=s[t-2];let v;
 if(y==16)v=a+b|0;else if(y==17)v=a-b|0;else if(y==18)v=Math.imul(a,b);
-else if(y==19){if(!b)return E(4);v=a==-2147483648&&b==-1?a:a/b|0;}
-else if(y==20){if(!b)return E(4);v=b==-1?0:a%b|0;}
-else if(y==21){if(!b)return E(4);v=Math.floor((a>>>0)/(b>>>0))|0;}
+else if(y==19){if(!b)return E(4);v=a/b|0;}
+else if(y==20){if(!b)return E(4);v=a%b|0;}
+else if(y==21){if(!b)return E(4);v=(a>>>0)/(b>>>0)|0;}
 else if(y==22){if(!b)return E(4);v=(a>>>0)%(b>>>0)|0;}
 else if(y==24)v=a&b;else if(y==25)v=a|b;else if(y==26)v=a^b;
 else if(y==28)v=a<<(b&31);else if(y==29)v=a>>(b&31);else if(y==30)v=(a>>>(b&31))|0;
